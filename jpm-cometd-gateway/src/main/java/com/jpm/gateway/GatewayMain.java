@@ -6,16 +6,15 @@ import com.jpm.gateway.bayeux.BayeuxService;
 import com.jpm.gateway.bayeux.CookieExtractFilter;
 import com.jpm.gateway.config.GatewayConfig;
 import com.jpm.gateway.publisher.EventPublishServlet;
-import org.cometd.annotation.Service;
 import org.cometd.annotation.server.AnnotationCometDServlet;
 import org.eclipse.jetty.client.HttpClient;
 import org.eclipse.jetty.server.Server;
 import org.eclipse.jetty.servlet.FilterHolder;
 import org.eclipse.jetty.servlet.ServletContextHandler;
 import org.eclipse.jetty.servlet.ServletHolder;
-import org.eclipse.jetty.websocket.api.Session;
-import org.eclipse.jetty.websocket.servlet.WebSocketServlet;
-import org.eclipse.jetty.websocket.servlet.WebSocketServletFactory;
+
+import org.eclipse.jetty.websocket.jsr356.server.deploy.WebSocketServerContainerInitializer;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -28,86 +27,68 @@ public class GatewayMain {
 
     public static void main(String[] args) throws Exception {
 
-        // ── 1. 初始化 HTTP 客户端（调用 C++ 平台用）────
+        // ── 1. HTTP 客户端（调用 C++ 平台用）────────────
         HttpClient httpClient = new HttpClient();
         httpClient.start();
 
-        HttpUtils         httpUtils  = new HttpUtils(httpClient);
+        HttpUtils          httpUtils  = new HttpUtils(httpClient);
         PlatformAuthClient authClient = new PlatformAuthClient(httpUtils);
 
-        // ── 2. 创建 Jetty Server ──────────────────────
+        // 将 authClient 共享给 BayeuxService（通过静态持有，避免复杂 DI）
+        BayeuxService.setAuthClient(authClient);
+
+        // ── 2. Jetty Server ──────────────────────────────
         Server server = new Server(GatewayConfig.GATEWAY_PORT);
 
-        // ── 3. Servlet 上下文 ─────────────────────────
+        // ── 3. Servlet 上下文 ────────────────────────────
         ServletContextHandler context = new ServletContextHandler(
                 ServletContextHandler.SESSIONS
         );
         context.setContextPath("/");
         server.setHandler(context);
 
-        // 启用 WebSocket 支持
-        // 使用websocketServlet 注册 websocket支持
-        context.addServlet(new ServletHolder(new WebSocketServlet() {
-            @Override
-            public void configure(WebSocketServletFactory factory) {
-                factory.register(Websockethandler.class);
-            }
-        }), "/websocket");
+        // ✅ 修复核心：embedded 模式下必须用此方法初始化 WebSocket ServerContainer
+        //    configure() 会在 context 启动阶段正确注册 javax.websocket.server.ServerContainer
+        //    到 ServletContext attribute，CometD 的 WebSocketTransport 依赖这个 attribute
+        WebSocketServerContainerInitializer.configure(context, null);
 
-        // ── 4. Cookie 提取 Filter ─────────────────────
+        // ── 4. Cookie 提取 Filter ────────────────────────
         context.addFilter(
-            new FilterHolder(new CookieExtractFilter()),
-            GatewayConfig.COMETD_PATH + "/*",
-            EnumSet.of(DispatcherType.REQUEST)
+                new FilterHolder(new CookieExtractFilter()),
+                GatewayConfig.COMETD_PATH + "/*",
+                EnumSet.of(DispatcherType.REQUEST)
         );
 
-        // ── 5. CometD Servlet ─────────────────────────
+        // ── 5. CometD Servlet ─────────────────────────────
         AnnotationCometDServlet cometdServlet = new AnnotationCometDServlet();
         ServletHolder cometdHolder = new ServletHolder(cometdServlet);
 
-        cometdHolder.setInitParameter("cometdURLMapping", GatewayConfig.COMETD_PATH);
-
+        cometdHolder.setInitParameter("cometdURLMapping",  GatewayConfig.COMETD_PATH);
         cometdHolder.setInitParameter("timeout",
                 String.valueOf(GatewayConfig.SESSION_TIMEOUT_SECONDS * 1000L));
-        cometdHolder.setInitParameter("maxInterval", "15000");
-        cometdHolder.setInitParameter("logLevel", "1");
-        cometdHolder.setInitParameter("services",
-                BayeuxService.class.getName());
+        cometdHolder.setInitParameter("maxInterval",       "15000");
+        cometdHolder.setInitParameter("logLevel",          "1");
+        // BayeuxService 通过静态 authClient 获取依赖，无需构造参数
+        cometdHolder.setInitParameter("services",          BayeuxService.class.getName());
 
-        cometdHolder.setInitOrder(1);
+        cometdHolder.setInitOrder(1);  // CometD 最先初始化
         context.addServlet(cometdHolder, GatewayConfig.COMETD_PATH + "/*");
 
-        // ── 6. 事件接收 Servlet（供 C++ 平台调用）─────
+        // ── 6. 事件接收 Servlet ──────────────────────────
         ServletHolder publishHolder = new ServletHolder(new EventPublishServlet());
-        publishHolder.setInitOrder(2);
+        publishHolder.setInitOrder(2); // 在 CometD 之后初始化，此时 BayeuxServer 已就绪
         context.addServlet(publishHolder, GatewayConfig.INTERNAL_PUBLISH_PATH);
 
-        // ── 7. 启动 ────────────────────────────────────
+        // ── 7. 启动 ──────────────────────────────────────
         server.start();
 
         LOG.info("================================================");
-        LOG.info("  CometD Gateway started on port {}",       GatewayConfig.GATEWAY_PORT);
+        LOG.info("  CometD Gateway started on port {}", GatewayConfig.GATEWAY_PORT);
         LOG.info("  CometD : http://0.0.0.0:{}{}", GatewayConfig.GATEWAY_PORT, GatewayConfig.COMETD_PATH);
         LOG.info("  Publish: http://0.0.0.0:{}{}", GatewayConfig.GATEWAY_PORT, GatewayConfig.INTERNAL_PUBLISH_PATH);
-        LOG.info("  C++ platform: {}",              GatewayConfig.CPP_PLATFORM_URL);
+        LOG.info("  C++ platform: {}", GatewayConfig.CPP_PLATFORM_URL);
         LOG.info("================================================");
 
         server.join();
-    }
-
-    // Websocket handlers
-    public static class Websockethandler {
-        public void onWebSocketConnect(Session session) {
-            LOG.info("Connected to websocket: {}", session.getRemoteAddress());
-        }
-        public void onWebsocketText(String message) {
-            LOG.info("Receive message {}", message);
-        }
-        public void onWebsocketClose(int statusCode, String reason) {
-            LOG.info("WebSocket closed, errorCode = {}, reason = {}", statusCode, reason);
-        }
-        public void onWebsocketError(Throwable cause) {
-            cause.printStackTrace();
-        }
     }
 }

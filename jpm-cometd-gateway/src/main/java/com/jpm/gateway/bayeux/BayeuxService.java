@@ -4,8 +4,8 @@ import com.jpm.gateway.auth.PlatformAuthClient;
 import com.jpm.gateway.auth.PlatformAuthClient.AuthResult;
 import com.jpm.gateway.config.GatewayConfig;
 import org.cometd.bayeux.server.*;
-import org.cometd.annotation.Session;
 import org.cometd.annotation.Service;
+import org.cometd.annotation.Session;
 import org.cometd.server.DefaultSecurityPolicy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -15,10 +15,24 @@ import javax.inject.Inject;
 import java.util.HashMap;
 import java.util.Map;
 
+/**
+ * CometD Bayeux 服务
+ *
+ * AnnotationCometDServlet 通过反射无参构造实例化此类，
+ * 所以 authClient 不能通过构造函数注入，改为静态持有。
+ * GatewayMain 在 server.start() 之前调用 setAuthClient() 完成注入。
+ */
 @Service("BayeuxService")
 public class BayeuxService {
 
     private static final Logger LOG = LoggerFactory.getLogger(BayeuxService.class);
+
+    // ✅ 静态持有，GatewayMain 在启动时注入
+    private static volatile PlatformAuthClient authClient;
+
+    public static void setAuthClient(PlatformAuthClient client) {
+        authClient = client;
+    }
 
     @Inject
     private BayeuxServer bayeuxServer;
@@ -26,33 +40,28 @@ public class BayeuxService {
     @Session
     private LocalSession sender;
 
-    private final PlatformAuthClient authClient;
-
-    public BayeuxService(PlatformAuthClient authClient) {
-        this.authClient = authClient;
-    }
+    // ✅ 无参构造，供 AnnotationCometDServlet 反射使用
+    public BayeuxService() {}
 
     @PostConstruct
     public void init() {
-        bayeuxServer.setSecurityPolicy((SecurityPolicy) new HandshakeSecurityPolicy(authClient));
+        if (authClient == null) {
+            throw new IllegalStateException(
+                    "BayeuxService: authClient not set. Call BayeuxService.setAuthClient() before server.start()");
+        }
+        bayeuxServer.setSecurityPolicy(new HandshakeSecurityPolicy());
         bayeuxServer.addListener(new SessionLifecycleListener());
         bayeuxServer.setOption("timeout", GatewayConfig.SESSION_TIMEOUT_SECONDS * 1000L);
         LOG.info("BayeuxService initialized");
     }
 
-    // ── 握手安全策略 ─────────────────────────────
+    // ── 握手安全策略 ─────────────────────────────────
     private static class HandshakeSecurityPolicy extends DefaultSecurityPolicy {
-
-        private final PlatformAuthClient authClient;
-
-        HandshakeSecurityPolicy(PlatformAuthClient authClient) {
-            this.authClient = authClient;
-        }
 
         @Override
         public boolean canHandshake(BayeuxServer server,
-                                     ServerSession session,
-                                     ServerMessage message) {
+                                    ServerSession session,
+                                    ServerMessage message) {
             Map<String, Object> ext = message.getExt();
             String accountToken = ext != null ? (String) ext.get("account_token") : null;
             String ssoCookie    = (String) session.getAttribute("SSO_COOKIE_KEY");
@@ -68,11 +77,10 @@ public class BayeuxService {
                 return false;
             }
 
-            // 存入 session 供后续订阅校验使用
             session.setAttribute("domain_id", result.domainId);
             session.setAttribute("username",  result.username);
 
-            // 握手回复中写入 domain_id（终端需要用它来构造订阅通道名）
+            // 回复中写入 domain_id，终端用它构造订阅通道名
             Map<String, Object> replyExt = new HashMap<>();
             replyExt.put("user_domain_moid", result.domainId);
             replyExt.put("ack", true);
@@ -85,9 +93,9 @@ public class BayeuxService {
 
         @Override
         public boolean canSubscribe(BayeuxServer server,
-                                     ServerSession session,
-                                     ServerChannel channel,
-                                     ServerMessage message) {
+                                    ServerSession session,
+                                    ServerChannel channel,
+                                    ServerMessage message) {
             String domainId  = (String) session.getAttribute("domain_id");
             String channelId = channel.getId();
 
@@ -95,8 +103,6 @@ public class BayeuxService {
                 LOG.warn("Subscribe rejected: no domain_id, clientId={}", session.getId());
                 return false;
             }
-
-            // 通道必须以 /userdomains/{domain_id} 开头
             if (!channelId.startsWith("/userdomains/" + domainId)) {
                 LOG.warn("Subscribe rejected: channel={} not in domain={}", channelId, domainId);
                 return false;
@@ -107,7 +113,7 @@ public class BayeuxService {
         }
     }
 
-    // ── 会话生命周期日志 ─────────────────────────
+    // ── 会话生命周期日志 ──────────────────────────────
     private static class SessionLifecycleListener implements BayeuxServer.SessionListener {
 
         @Override
