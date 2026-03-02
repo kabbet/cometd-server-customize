@@ -6,6 +6,7 @@ import com.jpm.gateway.bayeux.BayeuxService;
 import com.jpm.gateway.bayeux.CookieExtractFilter;
 import com.jpm.gateway.config.GatewayConfig;
 import com.jpm.gateway.publisher.EventPublishServlet;
+import org.cometd.annotation.Service;
 import org.cometd.annotation.server.AnnotationCometDServlet;
 import org.eclipse.jetty.client.HttpClient;
 import org.eclipse.jetty.server.Server;
@@ -63,19 +64,23 @@ public class GatewayMain {
         // ── 5. CometD Servlet ─────────────────────────
         AnnotationCometDServlet cometdServlet = new AnnotationCometDServlet();
         ServletHolder cometdHolder = new ServletHolder(cometdServlet);
+
+        cometdHolder.setInitParameter("cometdURLMapping", GatewayConfig.COMETD_PATH);
+
         cometdHolder.setInitParameter("timeout",
                 String.valueOf(GatewayConfig.SESSION_TIMEOUT_SECONDS * 1000L));
         cometdHolder.setInitParameter("maxInterval", "15000");
+        cometdHolder.setInitParameter("logLevel", "1");
         cometdHolder.setInitParameter("services",
-                BayeuxService.class.getName() + ":" + authClient.getClass().getName());
+                BayeuxService.class.getName());
+
         cometdHolder.setInitOrder(1);
         context.addServlet(cometdHolder, GatewayConfig.COMETD_PATH + "/*");
 
         // ── 6. 事件接收 Servlet（供 C++ 平台调用）─────
-        context.addServlet(
-            new ServletHolder(new EventPublishServlet()),
-            GatewayConfig.INTERNAL_PUBLISH_PATH
-        );
+        ServletHolder publishHolder = new ServletHolder(new EventPublishServlet());
+        publishHolder.setInitOrder(2);
+        context.addServlet(publishHolder, GatewayConfig.INTERNAL_PUBLISH_PATH);
 
         // ── 7. 启动 ────────────────────────────────────
         server.start();
