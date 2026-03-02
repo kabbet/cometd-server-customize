@@ -62,6 +62,10 @@ public class BayeuxService {
         public boolean canHandshake(BayeuxServer server,
                                     ServerSession session,
                                     ServerMessage message) {
+            if (session.isLocalSession()) {
+                LOG.debug("Handshake allowed for local session: {}", session.getId());
+                return true;
+            }
             Map<String, Object> ext = message.getExt();
             String accountToken = ext != null ? (String) ext.get("account_token") : null;
             String ssoCookie    = (String) session.getAttribute("SSO_COOKIE_KEY");
@@ -96,6 +100,9 @@ public class BayeuxService {
                                     ServerSession session,
                                     ServerChannel channel,
                                     ServerMessage message) {
+            if (session.isLocalSession()) {
+                return true;
+            }
             String domainId  = (String) session.getAttribute("domain_id");
             String channelId = channel.getId();
 
